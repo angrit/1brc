@@ -66,7 +66,7 @@ class Program
         var prevCount = totalEntries;
 
         var measurements = new SortedDictionary<string, MeasurementStats>();
-        foreach (var chunk in MeasurementGenerator())
+        foreach (var chunk in ReadMeasurementChunks())
         {
             sw.Restart();
             var entries = 0;
@@ -116,7 +116,7 @@ class Program
     /// <param name="chunkSize"></param>
     /// <param name="limit"></param>
     /// <returns></returns>
-    static IEnumerable<string> MeasurementGenerator(string path = "../measurements.txt", int chunkSize = 256, int limit = 1_000_000)
+    static IEnumerable<string> ReadMeasurementChunks(string path = "../measurements.txt", int chunkSize = 256, int limit = 1_000_000)
     {
         var buf = new byte[chunkSize];
         var chunk = chunkSize;
@@ -173,7 +173,7 @@ class Program
     {
         var cities = new Dictionary<string,int>();
 
-        foreach (var chunk in WeatherStationGenerator())
+        foreach (var chunk in ReadWeatherStationChunks())
         {
             foreach (var city in chunk.Split('\n', StringSplitOptions.RemoveEmptyEntries))
             {
@@ -193,7 +193,7 @@ class Program
     /// <param name="path"></param>
     /// <param name="chunkSize"></param>
     /// <returns></returns>
-    static IEnumerable<string> WeatherStationGenerator(string path = "../data/weather_stations.csv", int chunkSize = 1024)
+    static IEnumerable<string> ReadWeatherStationChunks(string path = "../data/weather_stations.csv", int chunkSize = 1024)
     {
         var buf = new byte[chunkSize];
         var chunk = chunkSize;
