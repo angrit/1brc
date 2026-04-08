@@ -1,10 +1,19 @@
-﻿using System.Diagnostics;
+﻿using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Text;
+using System.Threading.Channels;
 
 namespace _1brc_cs;
 
 class Program
 {
+    private static readonly Channel<string> Work = Channel.CreateBounded<string>(new BoundedChannelOptions(512)
+    {
+        FullMode = BoundedChannelFullMode.Wait,
+        SingleReader = true,
+        SingleWriter = true
+    });
+    
     struct MeasurementStats
     {
         public int Min = 0;
@@ -16,7 +25,7 @@ class Program
         { }
     }
 
-    static void Main(string[] args)
+    static async Task Main(string[] args)
     {
         Console.WriteLine("=== 1BRC ===");
 
@@ -28,8 +37,12 @@ class Program
         // foreach (var city in cities)
         //     Console.WriteLine(city);
 
+        var produce = Task.Run(() => ReadMeasurementChunks());
+        var consume = Task.Run(() => ReadMeasurements());
+        await Task.WhenAll(produce, consume);
+
         // Read and Output Measurements
-        var measurements = ReadMeasurements();
+        var measurements = await consume;
         foreach (var stat in measurements)
         {
             // Emits the results on stdout: sorted alphabetically by station name, values per station, rounded to one fractional digit
@@ -44,7 +57,7 @@ class Program
         // DebugStats(measurements);
     }
 
-    static void DebugStats(SortedDictionary<string,MeasurementStats> stats)
+    static void DebugStats(ConcurrentDictionary<string,MeasurementStats> stats)
     {
         foreach (var stat in stats)
         {
@@ -59,51 +72,55 @@ class Program
     /// Reads through the measurements chunks to calculate the Sum, Min, Max
     /// </summary>
     /// <returns></returns>
-    static SortedDictionary<string, MeasurementStats> ReadMeasurements()
+    static async Task<ConcurrentDictionary<string, MeasurementStats>> ReadMeasurements()
     {
+        Console.WriteLine($"[Consumer] Core/Thread ID: {Environment.CurrentManagedThreadId}");
+        
         var sw = new Stopwatch();
         var totalEntries = 0;
         var prevCount = totalEntries;
 
-        var measurements = new SortedDictionary<string, MeasurementStats>();
-        foreach (var chunk in ReadMeasurementChunks())
-        {
-            sw.Restart();
-            var entries = 0;
-            
-            foreach (var measurement in chunk.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        var workConsumer = Work.Reader;
+
+        var measurements = new ConcurrentDictionary<string, MeasurementStats>();
+        await Parallel.ForEachAsync(workConsumer.ReadAllAsync(), async (chunk, ct) =>
             {
-                var (stationName, value) = StationParseValue(measurement);
-                if (measurements.TryGetValue(stationName, out var stats))
+                sw.Restart();
+                var entries = 0;
+
+                foreach (var measurement in chunk.Split('\n', StringSplitOptions.RemoveEmptyEntries))
                 {
-                    stats.Sum += value;
-                    stats.Min = Math.Min(stats.Min, value);
-                    stats.Max = Math.Max(stats.Max, value);
-                    stats.NumEntries += 1;
-                    measurements[stationName] = stats;
-                }
-                else
-                {
-                    measurements[stationName] = new MeasurementStats
+                    var (stationName, value) = StationParseValue(measurement);
+                    if (measurements.TryGetValue(stationName, out var stats))
                     {
-                        Sum = value,
-                        Min = value,
-                        Max = value,
-                        NumEntries = 1
-                    };
+                        stats.Sum += value;
+                        stats.Min = Math.Min(stats.Min, value);
+                        stats.Max = Math.Max(stats.Max, value);
+                        stats.NumEntries += 1;
+                        measurements[stationName] = stats;
+                    }
+                    else
+                    {
+                        measurements[stationName] = new MeasurementStats
+                        {
+                            Sum = value,
+                            Min = value,
+                            Max = value,
+                            NumEntries = 1
+                        };
 
+                    }
+                    entries++;
                 }
-                entries++;
-            }
 
-            sw.Stop();
-            totalEntries += entries;
-            if (totalEntries > prevCount + 1_000_000)
-            {
-                Console.WriteLine($"Elapsed: {sw.Elapsed.TotalMicroseconds} micro-secs for {entries} entries, total_entries: {totalEntries}");
-                prevCount = totalEntries;
-            }
-        }
+                sw.Stop();
+                totalEntries += entries;
+                if (totalEntries > prevCount + 1_000_000)
+                {
+                    Console.WriteLine($"Elapsed: {sw.Elapsed.TotalMicroseconds} micro-secs for {entries} entries, total_entries: {totalEntries}");
+                    prevCount = totalEntries;
+                }
+            });
 
         return measurements;
     }
@@ -116,32 +133,45 @@ class Program
     /// <param name="chunkSize"></param>
     /// <param name="limit"></param>
     /// <returns></returns>
-    static IEnumerable<string> ReadMeasurementChunks(string path = "../measurements.txt", int chunkSize = 256, int limit = 1_000_000)
+    static async Task ReadMeasurementChunks(string path = "../measurements.txt", int chunkSize = 1000*1000, int limit = 100_000_000)
     {
+        Console.WriteLine($"[Producer] Core/Thread ID: {Environment.CurrentManagedThreadId}");
+
+        var sw = new Stopwatch();
+        sw.Start();
+
         var buf = new byte[chunkSize];
         var chunk = chunkSize;
         var offset = 0;
         int bytesRead;
         var fileBytes = 0;
 
-        using FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read);
-        while ((bytesRead = fs.Read(buf, offset, chunk)) > 0 && (limit == 0 || fileBytes < limit))
+        var workProducer = Work.Writer;
+
+        await using FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.None, chunkSize, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        while ((bytesRead = await fs.ReadAsync(buf, offset, chunk)) > 0 && (limit == 0 || fileBytes < limit))
         {
             var totalBytes = offset + bytesRead;
             fileBytes += totalBytes;
-            
-            var lastNewlinePos = LastIndexOf(buf, totalBytes) +1;
+
+            var lastNewlinePos = LastIndexOf(buf, totalBytes) + 1;
             var slice = buf[..lastNewlinePos];
             var rest = buf[lastNewlinePos..];
             rest.CopyTo(buf, 0);
 
             var decodedString = Encoding.UTF8.GetString(slice);
+            // Console.WriteLine(decodedString);
 
-            yield return decodedString;
+            await workProducer.WriteAsync(decodedString);
 
             offset = rest.Length;
             chunk = chunkSize - rest.Length;
         }
+
+        sw.Stop();
+        workProducer.Complete();
+
+        Console.WriteLine($"[WRITER] {nameof(ReadMeasurementChunks)} <-- is finished, which took {sw.Elapsed.TotalMilliseconds / 1000} seconds");
     }
 
     /// <summary>
